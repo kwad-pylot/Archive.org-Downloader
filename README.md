@@ -83,7 +83,17 @@ optional arguments:
   -m, --meta            Output the metadata of the book to a json file
   -P, --print-disabled  Try to download books restricted to patrons with print
                         disabilities (requires a whitelisted account)
+  -x, --text            Also save the OCR text: a folder with one XML per page
+                        (word boxes) and a .md of the whole book
+  -X, --text-only       Only save the OCR text, no images or PDF
+  -k, --keep-loan       Do not return the book when done
 ```
+
+### OCR text
+`-x` / `-X` save the text layer that the archive.org reader uses, into a `<title>_text` folder: one XML per page (page size and a box for every word, numbered like the page images, so it lines up with them) and `<title>.md` with the whole book, one heading per page.
+
+### Windows one-click
+Put `email=...`, `password=...` and optionally `return_book=no` on separate lines in `login.txt`, then double-click `get-book.bat`. It asks what to download and for the book links.
 The `email` and `password` fields are required, so to use this script you must have a registered account on archive.org.
 The `-r` argument specifies the resolution of the images (0 is the best quality).
 The PDF are downloaded in the current folder

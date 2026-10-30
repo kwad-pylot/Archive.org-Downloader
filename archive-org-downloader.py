@@ -12,6 +12,7 @@ import json
 import re
 import base64
 import hashlib
+import xml.etree.ElementTree as ET
 from Crypto.Cipher import AES
 from Crypto.Util import Counter
 
@@ -30,7 +31,7 @@ def get_book_infos(session, url, allow_print_disabled=False):
 	if is_print_disabled_only:
 		if not allow_print_disabled:
 			print("[-] You cannot download this book. It is only available to patrons with print disabilities.")
-			return None, None, None
+			return None, None, None, None
 		print("[!] This book is only available to patrons with print disabilities, continuing anyway.")
 	title = data['brOptions']['bookTitle'].strip().replace(" ", "_")
 	title = ''.join( c for c in title if c not in '<>:"/\\|?*' ) # Filter forbidden chars in directory names (Windows & Linux)
@@ -41,12 +42,18 @@ def get_book_infos(session, url, allow_print_disabled=False):
 		for page in item:
 			links.append(page['uri'])
 
+	# OCR text layer (words + boxes), the same one the web reader uses
+	text_url = None
+	zip_path = data['brOptions'].get('zip')
+	if zip_path:
+		text_url = f"https://{data['brOptions']['server']}/BookReader/BookReaderGetTextWrapper.php?path={zip_path.replace('_jp2.zip', '_djvu.xml')}&mode=djvu_xml"
+
 	if len(links) > 1:
 		print(f"[+] Found {len(links)} pages")
-		return title, links, metadata
+		return title, links, metadata, text_url
 	else:
 		print(f"[-] Error while getting image links")
-		return None, None, None
+		return None, None, None, None
 
 def login(email, password):
 	session = requests.Session()
@@ -113,8 +120,8 @@ def return_loan(session, book_id):
 	else:
 		display_error(response, "Something went wrong when trying to return the book")
 
-def image_name(pages, page, directory):
-	return f"{directory}/{(len(str(pages)) - len(str(page))) * '0'}{page}.jpg"
+def image_name(pages, page, directory, ext="jpg"):
+	return f"{directory}/{(len(str(pages)) - len(str(page))) * '0'}{page}.{ext}"
 
 def deobfuscate_image(image_data, link, obf_header):
 	"""
@@ -209,6 +216,45 @@ def download(session, n_threads, directory, links, scale, book_id):
 	images = [image_name(pages, i, directory) for i in range(len(links))]
 	return images
 
+def download_one_text(session, text_url, i, directory, book_id, pages):
+	# Saves the page's raw OCR XML (page size + a box for every word, lines the
+	# image of the same number) and returns the page's plain text
+	response = None
+	for attempt in range(5):
+		try:
+			response = session.get(f"{text_url}&page={i}", headers={"Referer": "https://archive.org/"})
+			if response.status_code == 200:
+				break
+			if response.status_code == 403:
+				session = loan(session, book_id, verbose=False)
+		except:
+			pass
+		time.sleep(1)	# Wait 1 second before retrying
+	if response is None or response.status_code != 200:
+		print(f"[ERROR] No text for page {i + 1}")
+		return ""
+
+	with open(image_name(pages, i, directory, "xml"), "wb") as f:
+		f.write(response.content)
+	try:
+		root = ET.fromstring(response.content)
+	except ET.ParseError:
+		return ""
+	# Lines kept as printed, a blank line between paragraphs
+	return "\n\n".join("\n".join(" ".join(w.text or "" for w in line.iter("WORD")) for line in para.iter("LINE")) for para in root.iter("PARAGRAPH"))
+
+def download_text(session, n_threads, directory, text_url, pages, book_id, title):
+	print("Downloading text...")
+	os.makedirs(directory, exist_ok=True)
+	with futures.ThreadPoolExecutor(max_workers=n_threads) as executor:
+		texts = list(tqdm(executor.map(lambda i: download_one_text(session, text_url, i, directory, book_id, pages), range(pages)), total=pages))
+	md_file = os.path.join(directory, title + ".md")
+	with open(md_file, "w", encoding="utf-8") as f:
+		f.write(f"# {title.replace('_', ' ')}\n\n")
+		for i, text in enumerate(texts):
+			f.write(f"## Page {i + 1}\n\n{text}\n\n")
+	print(f"[+] Text saved in \"{directory}\"")
+
 def make_pdf(pdf, title, directory):
 	file = title+".pdf"
 	# Handle the case where multiple books with the same name are downloaded
@@ -234,6 +280,9 @@ if __name__ == "__main__":
 	my_parser.add_argument('-j', '--jpg', help="Output to individual JPG's rather than a PDF", action='store_true')
 	my_parser.add_argument('-m', '--meta', help="Output the metadata of the book to a json file (-j option required)", action='store_true')
 	my_parser.add_argument('-P', '--print-disabled', help="Try to download books restricted to patrons with print disabilities (requires a whitelisted account)", action='store_true')
+	my_parser.add_argument('-x', '--text', help="Also save the OCR text: a folder with one XML per page (word boxes) and a .md of the whole book", action='store_true')
+	my_parser.add_argument('-X', '--text-only', help="Only save the OCR text, no images or PDF", action='store_true')
+	my_parser.add_argument('-k', '--keep-loan', help="Do not return the book when done", action='store_true')
 
 	if len(sys.argv) == 1:
 		my_parser.print_help(sys.stderr)
@@ -279,8 +328,18 @@ if __name__ == "__main__":
 		print("="*40)
 		print(f"Current book: https://archive.org/details/{book_id}")
 		session = loan(session, book_id)
-		title, links, metadata = get_book_infos(session, url, args.print_disabled)
+		title, links, metadata, text_url = get_book_infos(session, url, args.print_disabled)
 		if title is None or links is None or metadata is None:
+			continue
+
+		if args.text or args.text_only:
+			if text_url:
+				download_text(session, n_threads, os.path.join(d, title + "_text"), text_url, len(links), book_id, title)
+			else:
+				print("[-] No OCR text found for this book")
+		if args.text_only:
+			if not args.keep_loan:
+				return_loan(session, book_id)
 			continue
 
 		directory = os.path.join(d, title)
@@ -340,4 +399,5 @@ if __name__ == "__main__":
 			except OSError as e:
 				print ("Error: %s - %s." % (e.filename, e.strerror))
 
-		return_loan(session, book_id)
+		if not args.keep_loan:
+			return_loan(session, book_id)
